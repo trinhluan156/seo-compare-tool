@@ -1,11 +1,9 @@
 {
   "name": "seo-compare",
   "version": "1.0.0",
-  "description": "Tool so sánh nội dung DOCX với bài viết trên web",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@mozilla/readability": "^0.5.0",
@@ -14,7 +12,6 @@
     "diff": "^7.0.0",
     "express": "^4.21.2",
     "jsdom": "^26.0.0",
-    "mammoth": "^1.8.0",
     "multer": "^1.4.5-lts.1",
     "playwright": "^1.58.2"
   }

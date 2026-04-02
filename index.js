@@ -11,53 +11,32 @@ process.env.PLAYWRIGHT_BROWSERS_PATH =
   process.env.PLAYWRIGHT_BROWSERS_PATH || "0";
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
 
-/**
- * Chặn sớm request quá lớn trước khi Multer đọc hết vào RAM
- */
-app.use((req, res, next) => {
-  const contentLength = Number(req.headers["content-length"] || 0);
-  const maxBytes = 6 * 1024 * 1024; // nhỉnh hơn giới hạn file 5MB một chút
-
-  if (contentLength > maxBytes) {
-    return res.status(413).json({
-      error: "Request quá lớn. Vui lòng dùng file DOCX nhỏ hơn 5MB."
-    });
-  }
-
-  next();
-});
-
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
+  limits: { fileSize: 10 * 1024 * 1024 }
 });
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-const URL_CACHE_TTL_MS = 2 * 60 * 1000;
-const URL_CACHE_MAX_SIZE = 5;
+const URL_CACHE_TTL_MS = 3 * 60 * 1000;
+const MAX_CACHE_ITEMS = 10;
 const urlCache = new Map();
 
 let sharedBrowser = null;
 let browserInitPromise = null;
 
-/**
- * Lazy-loaded heavy libs
- */
-let mammothLib = null;
+/* =========================
+   LAZY LOAD HEAVY LIBS
+========================= */
+
 let playwrightLib = null;
 let jsdomLib = null;
 let readabilityLib = null;
-
-async function getMammoth() {
-  if (!mammothLib) mammothLib = require("mammoth");
-  return mammothLib;
-}
 
 async function getPlaywright() {
   if (!playwrightLib) playwrightLib = require("playwright");
@@ -75,7 +54,7 @@ async function getReadability() {
 }
 
 /* =========================
-   BASIC HELPERS
+   DEBUG MEMORY
 ========================= */
 
 function logMemory(label) {
@@ -83,9 +62,14 @@ function logMemory(label) {
   console.log(label, {
     rssMB: (m.rss / 1024 / 1024).toFixed(1),
     heapUsedMB: (m.heapUsed / 1024 / 1024).toFixed(1),
-    heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1)
+    heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1),
+    externalMB: (m.external / 1024 / 1024).toFixed(1)
   });
 }
+
+/* =========================
+   BASIC HELPERS
+========================= */
 
 function isValidHttpUrl(value) {
   try {
@@ -196,6 +180,19 @@ function similarityScore(a, b) {
   return common / Math.max(wordsA.length, wordsB.length);
 }
 
+function safeDecodeBufferToString(buffer) {
+  if (!buffer) return "";
+  return buffer.toString("utf8").replace(/^\uFEFF/, "");
+}
+
+function pruneCache() {
+  while (urlCache.size > MAX_CACHE_ITEMS) {
+    const oldestKey = urlCache.keys().next().value;
+    if (!oldestKey) break;
+    urlCache.delete(oldestKey);
+  }
+}
+
 /* =========================
    BROWSER REUSE
 ========================= */
@@ -241,14 +238,15 @@ async function closeSharedBrowser() {
   }
 }
 
-async function shutdown(signal) {
-  console.log(`Nhận tín hiệu ${signal}, đang tắt browser...`);
+process.on("SIGINT", async () => {
   await closeSharedBrowser();
   process.exit(0);
-}
+});
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGTERM", async () => {
+  await closeSharedBrowser();
+  process.exit(0);
+});
 
 /* =========================
    HTML FETCH
@@ -265,7 +263,9 @@ async function getHtmlWithAxios(url) {
     }
   });
 
-  return response.data;
+  return typeof response.data === "string"
+    ? response.data
+    : String(response.data || "");
 }
 
 async function looksLikeReadableArticle(html, url) {
@@ -312,14 +312,6 @@ async function getHtmlWithPlaywright(url) {
   }
 }
 
-function pruneUrlCache() {
-  while (urlCache.size > URL_CACHE_MAX_SIZE) {
-    const oldestKey = urlCache.keys().next().value;
-    if (!oldestKey) break;
-    urlCache.delete(oldestKey);
-  }
-}
-
 async function getBestHtml(url) {
   const cached = urlCache.get(url);
   if (cached && Date.now() - cached.createdAt < URL_CACHE_TTL_MS) {
@@ -327,6 +319,7 @@ async function getBestHtml(url) {
   }
 
   let html;
+
   try {
     const axiosHtml = await getHtmlWithAxios(url);
     if (await looksLikeReadableArticle(axiosHtml, url)) {
@@ -344,7 +337,7 @@ async function getBestHtml(url) {
     createdAt: Date.now()
   });
 
-  pruneUrlCache();
+  pruneCache();
   return html;
 }
 
@@ -363,7 +356,7 @@ async function cleanHtmlForComparison(html) {
 
   root
     .querySelectorAll(
-      "script, style, noscript, svg, canvas, iframe, figure, figcaption"
+      "script, style, noscript, svg, canvas, iframe, figure, figcaption, meta, link"
     )
     .forEach((el) => el.remove());
 
@@ -378,14 +371,15 @@ async function cleanHtmlForComparison(html) {
         attr.name === "class" ||
         attr.name === "id" ||
         attr.name.startsWith("data-") ||
-        attr.name.startsWith("aria-")
+        attr.name.startsWith("aria-") ||
+        attr.name.startsWith("on")
       ) {
         el.removeAttribute(attr.name);
       }
     });
   });
 
-  return root.innerHTML;
+  return root.innerHTML || "";
 }
 
 function headingLevel(tagName) {
@@ -464,7 +458,18 @@ async function extractOrderedBlocksFromHtml(html) {
     const tag = node.tagName.toLowerCase();
 
     if (
-      ["script", "style", "noscript", "svg", "canvas", "iframe", "figure", "figcaption"].includes(tag)
+      [
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "canvas",
+        "iframe",
+        "figure",
+        "figcaption",
+        "meta",
+        "link"
+      ].includes(tag)
     ) {
       return;
     }
@@ -484,7 +489,9 @@ async function extractOrderedBlocksFromHtml(html) {
       return;
     }
 
-    if (["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote"].includes(tag)) {
+    if (
+      ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote"].includes(tag)
+    ) {
       const text = normalizeForStrictCompare(node.textContent || "");
       if (text) pushBlock(tag, text);
       return;
@@ -493,11 +500,11 @@ async function extractOrderedBlocksFromHtml(html) {
     [...node.children].forEach(walk);
   }
 
-  if (!root) return blocks;
+  if (root) {
+    [...root.children].forEach(walk);
+  }
 
-  [...root.children].forEach(walk);
-
-  if (!blocks.length) {
+  if (!blocks.length && root) {
     const text = normalizeForStrictCompare(root.textContent || "");
     if (text) pushBlock("p", text);
   }
@@ -526,85 +533,35 @@ async function extractMainContentFromWeb(html, url) {
 
   return {
     title: article.title || "",
+    html: cleanHtml,
     blocks,
     fullText: blocksToFullText(blocks)
   };
 }
 
-/**
- * DOCX nhỏ: dùng HTML mode để giữ heading/list/table tốt hơn
- * Không trả về html để tránh giữ chuỗi lớn trong RAM
- */
-async function convertDocxToHtmlBlocks(buffer) {
-  const mammoth = await getMammoth();
-
-  const result = await mammoth.convertToHtml(
-    { buffer },
-    { includeDefaultStyleMap: true }
-  );
-
-  const cleanHtml = await cleanHtmlForComparison(result.value || "");
+async function extractContentFromUploadedHtml(htmlString) {
+  const cleanHtml = await cleanHtmlForComparison(htmlString);
   const blocks = await extractOrderedBlocksFromHtml(cleanHtml);
 
   return {
+    html: cleanHtml,
     blocks,
-    fullText: blocksToFullText(blocks),
-    messages: result.messages || []
+    fullText: blocksToFullText(blocks)
   };
-}
-
-/**
- * DOCX lớn: dùng raw text mode để giảm RAM
- */
-async function convertDocxToTextBlocks(buffer) {
-  const mammoth = await getMammoth();
-
-  const result = await mammoth.extractRawText({ buffer });
-
-  const rawText = result.value || "";
-  const lines = rawText
-    .split("\n")
-    .map((line) => normalizeForStrictCompare(line))
-    .filter(Boolean);
-
-  const blocks = lines.map((text, index) => ({
-    tag: "p",
-    group: "text",
-    level: null,
-    text,
-    order: index
-  }));
-
-  return {
-    blocks,
-    fullText: blocksToFullText(blocks),
-    messages: result.messages || []
-  };
-}
-
-async function convertDocxSmart(buffer) {
-  const sizeMB = buffer.length / 1024 / 1024;
-
-  // File lớn thì dùng extractRawText để tránh RAM tăng vọt
-  if (sizeMB > 1.5) {
-    return await convertDocxToTextBlocks(buffer);
-  }
-
-  return await convertDocxToHtmlBlocks(buffer);
 }
 
 /* =========================
    ALIGN + DIFF
 ========================= */
 
-function exactMatchAfterVietnameseNormalization(webFullText, docFullText) {
+function exactMatchAfterVietnameseNormalization(webFullText, fileFullText) {
   const webTokens = tokenizeVietnameseWords(webFullText).map(normalizeCompareTokenVi);
-  const docTokens = tokenizeVietnameseWords(docFullText).map(normalizeCompareTokenVi);
+  const fileTokens = tokenizeVietnameseWords(fileFullText).map(normalizeCompareTokenVi);
 
-  if (webTokens.length !== docTokens.length) return false;
+  if (webTokens.length !== fileTokens.length) return false;
 
   for (let i = 0; i < webTokens.length; i++) {
-    if (!equalViWord(webTokens[i], docTokens[i])) {
+    if (!equalViWord(webTokens[i], fileTokens[i])) {
       return false;
     }
   }
@@ -619,38 +576,38 @@ function blockThreshold(block) {
   return 0.58;
 }
 
-function blockCompatible(webBlock, docBlock) {
-  if (!webBlock || !docBlock) return false;
-  if (webBlock.group !== docBlock.group) return false;
+function blockCompatible(webBlock, fileBlock) {
+  if (!webBlock || !fileBlock) return false;
+  if (webBlock.group !== fileBlock.group) return false;
 
   if (webBlock.group === "heading") {
-    return webBlock.level === docBlock.level;
+    return webBlock.level === fileBlock.level;
   }
 
   return true;
 }
 
-function alignBlocksOrdered(webBlocks, docBlocks, lookAhead = 2) {
+function alignBlocksOrdered(webBlocks, fileBlocks, lookAhead = 2) {
   const pairs = [];
   let i = 0;
   let j = 0;
 
-  while (i < webBlocks.length && j < docBlocks.length) {
+  while (i < webBlocks.length && j < fileBlocks.length) {
     const w = webBlocks[i];
-    const d = docBlocks[j];
+    const f = fileBlocks[j];
 
-    if (blockCompatible(w, d)) {
-      const score = similarityScore(w.text, d.text);
+    if (blockCompatible(w, f)) {
+      const score = similarityScore(w.text, f.text);
       if (score >= blockThreshold(w)) {
         pairs.push({
           webIndex: i,
-          docIndex: j,
+          fileIndex: j,
           webText: w.text,
-          docText: d.text,
+          fileText: f.text,
           webTag: w.tag,
-          docTag: d.tag,
+          fileTag: f.tag,
           webGroup: w.group,
-          docGroup: d.group,
+          fileGroup: f.group,
           score
         });
         i++;
@@ -663,8 +620,8 @@ function alignBlocksOrdered(webBlocks, docBlocks, lookAhead = 2) {
 
     for (let offset = 1; offset <= lookAhead; offset++) {
       const nextWeb = webBlocks[i + offset];
-      if (nextWeb && blockCompatible(nextWeb, d)) {
-        const score = similarityScore(nextWeb.text, d.text);
+      if (nextWeb && blockCompatible(nextWeb, f)) {
+        const score = similarityScore(nextWeb.text, f.text);
         if (score >= blockThreshold(nextWeb)) {
           if (!best || score > best.score) {
             best = { kind: "skip-web", offset, score };
@@ -674,12 +631,12 @@ function alignBlocksOrdered(webBlocks, docBlocks, lookAhead = 2) {
     }
 
     for (let offset = 1; offset <= lookAhead; offset++) {
-      const nextDoc = docBlocks[j + offset];
-      if (nextDoc && blockCompatible(w, nextDoc)) {
-        const score = similarityScore(w.text, nextDoc.text);
+      const nextFile = fileBlocks[j + offset];
+      if (nextFile && blockCompatible(w, nextFile)) {
+        const score = similarityScore(w.text, nextFile.text);
         if (score >= blockThreshold(w)) {
           if (!best || score > best.score) {
-            best = { kind: "skip-doc", offset, score };
+            best = { kind: "skip-file", offset, score };
           }
         }
       }
@@ -690,17 +647,17 @@ function alignBlocksOrdered(webBlocks, docBlocks, lookAhead = 2) {
       continue;
     }
 
-    if (best?.kind === "skip-doc") {
+    if (best?.kind === "skip-file") {
       for (let k = 0; k < best.offset; k++) {
         pairs.push({
           webIndex: -1,
-          docIndex: j,
+          fileIndex: j,
           webText: "",
-          docText: docBlocks[j].text,
+          fileText: fileBlocks[j].text,
           webTag: "",
-          docTag: docBlocks[j].tag,
+          fileTag: fileBlocks[j].tag,
           webGroup: "",
-          docGroup: docBlocks[j].group,
+          fileGroup: fileBlocks[j].group,
           score: 0
         });
         j++;
@@ -710,29 +667,30 @@ function alignBlocksOrdered(webBlocks, docBlocks, lookAhead = 2) {
 
     pairs.push({
       webIndex: i,
-      docIndex: j,
+      fileIndex: j,
       webText: w.text,
-      docText: d.text,
+      fileText: f.text,
       webTag: w.tag,
-      docTag: d.tag,
+      fileTag: f.tag,
       webGroup: w.group,
-      docGroup: d.group,
-      score: blockCompatible(w, d) ? similarityScore(w.text, d.text) : 0
+      fileGroup: f.group,
+      score: blockCompatible(w, f) ? similarityScore(w.text, f.text) : 0
     });
+
     i++;
     j++;
   }
 
-  while (j < docBlocks.length) {
+  while (j < fileBlocks.length) {
     pairs.push({
       webIndex: -1,
-      docIndex: j,
+      fileIndex: j,
       webText: "",
-      docText: docBlocks[j].text,
+      fileText: fileBlocks[j].text,
       webTag: "",
-      docTag: docBlocks[j].tag,
+      fileTag: fileBlocks[j].tag,
       webGroup: "",
-      docGroup: docBlocks[j].group,
+      fileGroup: fileBlocks[j].group,
       score: 0
     });
     j++;
@@ -741,11 +699,11 @@ function alignBlocksOrdered(webBlocks, docBlocks, lookAhead = 2) {
   return pairs;
 }
 
-function getChangedDocWordsOnly(webText, docText) {
+function getChangedFileWordsOnly(webText, fileText) {
   const webWords = tokenizeVietnameseWords(webText);
-  const docWords = tokenizeVietnameseWords(docText);
+  const fileWords = tokenizeVietnameseWords(fileText);
 
-  const parts = Diff.diffArrays(webWords, docWords, {
+  const parts = Diff.diffArrays(webWords, fileWords, {
     comparator: (left, right) => equalViWord(left, right)
   });
 
@@ -760,18 +718,18 @@ function getChangedDocWordsOnly(webText, docText) {
   return changed;
 }
 
-function buildHighlightedBlock(docText, webText) {
-  const addedDocWords = getChangedDocWordsOnly(webText, docText);
+function buildHighlightedBlock(fileText, webText) {
+  const addedWords = getChangedFileWordsOnly(webText, fileText);
 
-  if (!addedDocWords.length) {
+  if (!addedWords.length) {
     return {
       changedCount: 0,
-      highlightedHtml: escapeHtml(docText)
+      highlightedHtml: escapeHtml(fileText)
     };
   }
 
-  const pool = [...addedDocWords];
-  const originalPieces = docText.match(/\S+|\s+/g) || [];
+  const pool = [...addedWords];
+  const originalPieces = fileText.match(/\S+|\s+/g) || [];
   let changedCount = 0;
 
   const html = originalPieces
@@ -802,17 +760,17 @@ function buildResultHtmlFromPairs(pairs) {
   let totalChangedCount = 0;
 
   for (const pair of pairs) {
-    if (pair.docIndex === -1) continue;
-    if (!pair.docText) continue;
+    if (pair.fileIndex === -1) continue;
+    if (!pair.fileText) continue;
 
     const minScore =
-      pair.docGroup === "heading" ? 0.5 :
-      pair.docGroup === "table" ? 0.35 :
+      pair.fileGroup === "heading" ? 0.5 :
+      pair.fileGroup === "table" ? 0.35 :
       0.32;
 
     if (pair.webIndex !== -1 && pair.score < minScore) continue;
 
-    const blockResult = buildHighlightedBlock(pair.docText, pair.webText);
+    const blockResult = buildHighlightedBlock(pair.fileText, pair.webText);
 
     if (blockResult.changedCount > 0) {
       totalChangedCount += blockResult.changedCount;
@@ -820,7 +778,9 @@ function buildResultHtmlFromPairs(pairs) {
       renderedBlocks.push(`
         <div class="diff-block">
           <div class="diff-block-meta">
-            Đoạn #${pair.docIndex + 1} | Loại: ${escapeHtml(pair.docTag || "text")} | Độ giống: ${(pair.score * 100).toFixed(1)}%
+            Đoạn #${pair.fileIndex + 1} | Loại: ${escapeHtml(
+              pair.fileTag || "text"
+            )} | Độ giống: ${(pair.score * 100).toFixed(1)}%
           </div>
           <div class="diff-block-content">${blockResult.highlightedHtml}</div>
         </div>
@@ -839,23 +799,27 @@ function buildResultHtmlFromPairs(pairs) {
 ========================= */
 
 app.get("/", (req, res) => {
-  res.send("SEO Compare Tool đang chạy.");
+  res.send("SEO Compare HTML Tool đang chạy.");
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    cacheItems: urlCache.size
+  });
 });
 
-app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
+app.post("/compare-html", upload.single("htmlFile"), async (req, res) => {
   try {
-    logMemory("before compare");
+    logMemory("before compare-html");
 
     const { url } = req.body;
     const file = req.file;
 
     if (!url || !file) {
       return res.status(400).json({
-        error: "Thiếu URL hoặc file DOCX"
+        error: "Thiếu URL hoặc file HTML"
       });
     }
 
@@ -865,22 +829,41 @@ app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
       });
     }
 
-    const docBuffer = file.buffer;
-    req.file = undefined;
+    const filename = (file.originalname || "").toLowerCase();
+    const mimetype = (file.mimetype || "").toLowerCase();
 
-    const renderedHtml = await getBestHtml(url);
-    logMemory("after getBestHtml");
+    const isHtmlFile =
+      filename.endsWith(".html") ||
+      filename.endsWith(".htm") ||
+      mimetype.includes("text/html");
 
-    const webData = await extractMainContentFromWeb(renderedHtml, url);
-    logMemory("after web extract");
+    if (!isHtmlFile) {
+      return res.status(400).json({
+        error: "Chỉ chấp nhận file .html hoặc .htm"
+      });
+    }
 
-    const docData = await convertDocxSmart(docBuffer);
-    logMemory("after docx convert");
+    const uploadedHtmlString = safeDecodeBufferToString(file.buffer);
+
+    if (!uploadedHtmlString.trim()) {
+      return res.status(400).json({
+        error: "File HTML rỗng hoặc không đọc được"
+      });
+    }
+
+    const webHtml = await getBestHtml(url);
+    logMemory("after get web html");
+
+    const webData = await extractMainContentFromWeb(webHtml, url);
+    logMemory("after extract web content");
+
+    const fileData = await extractContentFromUploadedHtml(uploadedHtmlString);
+    logMemory("after extract uploaded html");
 
     if (
       exactMatchAfterVietnameseNormalization(
         webData.fullText,
-        docData.fullText
+        fileData.fullText
       )
     ) {
       return res.json({
@@ -888,16 +871,20 @@ app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
         articleTitle: webData.title,
         changedCount: 0,
         exactMatchAfterNormalization: true,
-        highlightedDocHtml: `
+        highlightedHtml: `
           <div class="preview-box">
-            Nội dung DOCX khớp với nội dung chính của bài viết trên web sau khi chuẩn hóa tiếng Việt.
+            Nội dung file HTML khớp với nội dung chính của bài viết trên web sau khi chuẩn hóa tiếng Việt.
           </div>
         `,
-        conversionMessages: docData.messages
+        debug: {
+          webBlocks: webData.blocks.length,
+          fileBlocks: fileData.blocks.length,
+          alignedPairs: 0
+        }
       });
     }
 
-    const pairs = alignBlocksOrdered(webData.blocks, docData.blocks, 2);
+    const pairs = alignBlocksOrdered(webData.blocks, fileData.blocks, 2);
     const result = buildResultHtmlFromPairs(pairs);
 
     return res.json({
@@ -905,53 +892,32 @@ app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
       articleTitle: webData.title,
       changedCount: result.totalChangedCount,
       exactMatchAfterNormalization: false,
-      highlightedDocHtml:
+      highlightedHtml:
         result.totalChangedCount > 0
           ? result.html
           : `
             <div class="preview-box">
-              Không tìm thấy khác biệt đủ tin cậy sau khi đối chiếu.
+              Không tìm thấy khác biệt đủ tin cậy sau khi đối chiếu nội dung HTML với bài viết trên web.
             </div>
           `,
-      conversionMessages: docData.messages,
       debug: {
         webBlocks: webData.blocks.length,
-        docBlocks: docData.blocks.length,
+        fileBlocks: fileData.blocks.length,
         alignedPairs: pairs.length
       }
     });
   } catch (error) {
     console.error(error);
-    return res.status(500).json({
-      error: "Không thể xử lý file DOCX",
+    res.status(500).json({
+      error: "Không thể xử lý file HTML",
       details: error.message
     });
   }
 });
 
 /* =========================
-   ERROR HANDLER
+   START SERVER
 ========================= */
-
-app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({
-        error: "File DOCX quá lớn. Vui lòng dùng file dưới 5MB."
-      });
-    }
-
-    return res.status(400).json({
-      error: `Lỗi upload: ${err.message}`
-    });
-  }
-
-  console.error(err);
-  return res.status(500).json({
-    error: "Lỗi máy chủ",
-    details: err.message
-  });
-});
 
 logMemory("startup");
 
