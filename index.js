@@ -1,11 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
-const mammoth = require("mammoth");
 const Diff = require("diff");
-const { chromium } = require("playwright");
-const { JSDOM } = require("jsdom");
-const { Readability } = require("@mozilla/readability");
 const axios = require("axios");
 
 const app = express();
@@ -27,11 +23,41 @@ const upload = multer({
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-const URL_CACHE_TTL_MS = 5 * 60 * 1000;
+const URL_CACHE_TTL_MS = 3 * 60 * 1000;
+const URL_CACHE_MAX_ITEMS = 10;
 const urlCache = new Map();
 
 let sharedBrowser = null;
 let browserInitPromise = null;
+
+/* =========================
+   LAZY LOAD HEAVY LIBS
+========================= */
+
+let mammothLib = null;
+let playwrightLib = null;
+let jsdomLib = null;
+let readabilityLib = null;
+
+function getMammoth() {
+  if (!mammothLib) mammothLib = require("mammoth");
+  return mammothLib;
+}
+
+function getPlaywright() {
+  if (!playwrightLib) playwrightLib = require("playwright");
+  return playwrightLib;
+}
+
+function getJSDOM() {
+  if (!jsdomLib) jsdomLib = require("jsdom");
+  return jsdomLib;
+}
+
+function getReadability() {
+  if (!readabilityLib) readabilityLib = require("@mozilla/readability");
+  return readabilityLib;
+}
 
 /* =========================
    BASIC HELPERS
@@ -146,6 +172,23 @@ function similarityScore(a, b) {
   return common / Math.max(wordsA.length, wordsB.length);
 }
 
+function logMemory(label) {
+  const m = process.memoryUsage();
+  console.log(label, {
+    rssMB: (m.rss / 1024 / 1024).toFixed(1),
+    heapUsedMB: (m.heapUsed / 1024 / 1024).toFixed(1),
+    heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1)
+  });
+}
+
+function trimCacheIfNeeded() {
+  while (urlCache.size > URL_CACHE_MAX_ITEMS) {
+    const oldestKey = urlCache.keys().next().value;
+    if (!oldestKey) break;
+    urlCache.delete(oldestKey);
+  }
+}
+
 /* =========================
    BROWSER REUSE
 ========================= */
@@ -154,13 +197,19 @@ async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
   if (browserInitPromise) return browserInitPromise;
 
+  const { chromium } = getPlaywright();
+
   const launchOptions = {
     headless: true,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu"
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding"
     ]
   };
 
@@ -205,19 +254,27 @@ async function getHtmlWithAxios(url) {
   const response = await axios.get(url, {
     timeout: 12000,
     maxRedirects: 5,
+    responseType: "text",
+    transformResponse: [(data) => data],
     headers: {
       "User-Agent": DEFAULT_USER_AGENT,
       "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     }
   });
 
-  return response.data;
+  return typeof response.data === "string"
+    ? response.data
+    : String(response.data || "");
 }
 
-function looksLikeReadableArticle(html, url) {
+async function looksLikeReadableArticle(html, url) {
   try {
+    const { JSDOM } = getJSDOM();
+    const { Readability } = getReadability();
+
     const dom = new JSDOM(html, { url });
     const article = new Readability(dom.window.document).parse();
+
     return Boolean(
       article &&
         article.content &&
@@ -248,7 +305,9 @@ async function getHtmlWithPlaywright(url) {
     });
 
     await page.waitForTimeout(1200);
-    return await page.content();
+
+    const html = await page.content();
+    return html;
   } finally {
     await page.close();
   }
@@ -261,9 +320,11 @@ async function getBestHtml(url) {
   }
 
   let html;
+
   try {
     const axiosHtml = await getHtmlWithAxios(url);
-    if (looksLikeReadableArticle(axiosHtml, url)) {
+
+    if (await looksLikeReadableArticle(axiosHtml, url)) {
       html = axiosHtml;
     } else {
       html = await getHtmlWithPlaywright(url);
@@ -278,11 +339,7 @@ async function getBestHtml(url) {
     createdAt: Date.now()
   });
 
-  if (urlCache.size > 100) {
-    const oldestKey = urlCache.keys().next().value;
-    if (oldestKey) urlCache.delete(oldestKey);
-  }
-
+  trimCacheIfNeeded();
   return html;
 }
 
@@ -290,10 +347,14 @@ async function getBestHtml(url) {
    CONTENT EXTRACTION
 ========================= */
 
-function cleanHtmlForComparison(html) {
+async function cleanHtmlForComparison(html) {
+  const { JSDOM } = getJSDOM();
+
   const dom = new JSDOM(`<div id="root">${html}</div>`);
   const document = dom.window.document;
   const root = document.querySelector("#root");
+
+  if (!root) return "";
 
   root
     .querySelectorAll(
@@ -319,7 +380,10 @@ function cleanHtmlForComparison(html) {
     });
   });
 
-  return root.innerHTML;
+  const cleaned = root.innerHTML;
+
+  dom.window.close();
+  return cleaned;
 }
 
 function headingLevel(tagName) {
@@ -340,13 +404,12 @@ function getCellText(cell) {
 }
 
 function buildTableRowText(cells) {
-  return cells
-    .map((c) => normalizeForStrictCompare(c))
-    .filter(Boolean)
-    .join(" | ");
+  return cells.map((c) => normalizeForStrictCompare(c)).filter(Boolean).join(" | ");
 }
 
-function extractOrderedBlocksFromHtml(html) {
+async function extractOrderedBlocksFromHtml(html) {
+  const { JSDOM } = getJSDOM();
+
   const dom = new JSDOM(`<div id="root">${html}</div>`);
   const document = dom.window.document;
   const root = document.querySelector("#root");
@@ -425,13 +488,16 @@ function extractOrderedBlocksFromHtml(html) {
     [...node.children].forEach(walk);
   }
 
-  [...root.children].forEach(walk);
+  if (root) {
+    [...root.children].forEach(walk);
 
-  if (!blocks.length) {
-    const text = normalizeForStrictCompare(root.textContent || "");
-    if (text) pushBlock("p", text);
+    if (!blocks.length) {
+      const text = normalizeForStrictCompare(root.textContent || "");
+      if (text) pushBlock("p", text);
+    }
   }
 
+  dom.window.close();
   return blocks;
 }
 
@@ -439,17 +505,22 @@ function blocksToFullText(blocks) {
   return blocks.map((b) => b.text).join("\n");
 }
 
-function extractMainContentFromWeb(html, url) {
+async function extractMainContentFromWeb(html, url) {
+  const { JSDOM } = getJSDOM();
+  const { Readability } = getReadability();
+
   const dom = new JSDOM(html, { url });
   const reader = new Readability(dom.window.document);
   const article = reader.parse();
+
+  dom.window.close();
 
   if (!article || !article.content) {
     throw new Error("Không bóc được nội dung chính từ web");
   }
 
-  const cleanHtml = cleanHtmlForComparison(article.content);
-  const blocks = extractOrderedBlocksFromHtml(cleanHtml);
+  const cleanHtml = await cleanHtmlForComparison(article.content);
+  const blocks = await extractOrderedBlocksFromHtml(cleanHtml);
 
   return {
     title: article.title || "",
@@ -460,13 +531,15 @@ function extractMainContentFromWeb(html, url) {
 }
 
 async function convertDocxToHtml(buffer) {
+  const mammoth = getMammoth();
+
   const result = await mammoth.convertToHtml(
     { buffer },
     { includeDefaultStyleMap: true }
   );
 
-  const cleanHtml = cleanHtmlForComparison(result.value || "");
-  const blocks = extractOrderedBlocksFromHtml(cleanHtml);
+  const cleanHtml = await cleanHtmlForComparison(result.value || "");
+  const blocks = await extractOrderedBlocksFromHtml(cleanHtml);
 
   return {
     html: cleanHtml,
@@ -726,11 +799,17 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    cacheSize: urlCache.size
+  });
 });
 
 app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
   try {
+    logMemory("before compare");
+
     const { url } = req.body;
     const file = req.file;
 
@@ -747,8 +826,13 @@ app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
     }
 
     const renderedHtml = await getBestHtml(url);
-    const webData = extractMainContentFromWeb(renderedHtml, url);
+    logMemory("after getBestHtml");
+
+    const webData = await extractMainContentFromWeb(renderedHtml, url);
+    logMemory("after web extract");
+
     const docData = await convertDocxToHtml(file.buffer);
+    logMemory("after docx convert");
 
     if (
       exactMatchAfterVietnameseNormalization(
@@ -790,17 +874,20 @@ app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
       debug: {
         webBlocks: webData.blocks.length,
         docBlocks: docData.blocks.length,
-        alignedPairs: pairs.length
+        alignedPairs: pairs.length,
+        cacheSize: urlCache.size
       }
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
+    console.error("COMPARE ERROR:", error);
+    return res.status(500).json({
       error: "Không thể xử lý file DOCX",
       details: error.message
     });
   }
 });
+
+logMemory("startup");
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Tool đang chạy tại: http://0.0.0.0:${PORT}`);
