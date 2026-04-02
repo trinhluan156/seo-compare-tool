@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SEO Compare Tool</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="container">
+    <section class="hero card">
+      <h1>SEO Compare Tool</h1>
+      <p>
+        So sánh nội dung file DOCX với bài viết trên web, làm nổi bật phần khác biệt
+        để bạn kiểm tra nhanh trước khi đăng bài hoặc tối ưu SEO.
+      </p>
+    </section>
+
+    <section class="form-card card">
+      <form id="compareForm" class="form-grid">
+        <div class="field">
+          <label for="url">URL bài viết</label>
+          <input
+            class="input"
+            type="url"
+            id="url"
+            name="url"
+            required
+            placeholder="https://example.com/bai-viet"
+          />
+        </div>
+
+        <div class="field">
+          <label for="docxFile">File DOCX</label>
+          <input
+            class="file-input"
+            type="file"
+            id="docxFile"
+            name="docxFile"
+            accept=".docx"
+            required
+          />
+          <div class="file-note">Hỗ trợ file .docx, dung lượng tối đa 20MB.</div>
+        </div>
+
+        <div class="button-row">
+          <button id="submitBtn" type="submit">So sánh ngay</button>
+          <div id="status" class="status hidden">
+            <span class="status-dot"></span>
+            <span>Đang xử lý dữ liệu...</span>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section id="resultSection" class="result-card card hidden">
+      <div id="result"></div>
+    </section>
+
+    <div class="footer-note">
+      Tool chạy bằng Node.js, Express, Playwright và Mammoth.
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("compareForm");
+    const result = document.getElementById("result");
+    const resultSection = document.getElementById("resultSection");
+    const submitBtn = document.getElementById("submitBtn");
+    const status = document.getElementById("status");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+
+      resultSection.classList.remove("hidden");
+      result.innerHTML = "";
+      submitBtn.disabled = true;
+      status.classList.remove("hidden");
+
+      const fileInput = document.getElementById("docxFile");
+      const urlInput = document.getElementById("url");
+
+      const formData = new FormData();
+      formData.append("url", urlInput.value);
+      formData.append("docxFile", fileInput.files[0]);
+
+      try {
+        const res = await fetch("/compare-docx", {
+          method: "POST",
+          body: formData
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          result.innerHTML = `
+            <div class="error-box">
+              <strong>Lỗi:</strong> ${data.error || "Không xác định"}
+              ${data.details ? `<div style="margin-top:8px;">${data.details}</div>` : ""}
+            </div>
+          `;
+          return;
+        }
+
+        result.innerHTML = `
+          <div class="result-header">
+            <h2>${data.articleTitle || "Không có tiêu đề"}</h2>
+            <div class="result-meta">
+              <div class="meta-badge">Số từ khác: ${data.changedCount}</div>
+              <div class="meta-badge">
+                Chuẩn hóa khớp hoàn toàn: ${data.exactMatchAfterNormalization ? "Có" : "Không"}
+              </div>
+            </div>
+          </div>
+
+          <div class="diff-list">
+            ${data.highlightedDocHtml}
+          </div>
+        `;
+      } catch (err) {
+        result.innerHTML = `
+          <div class="error-box">
+            <strong>Lỗi:</strong> ${err.message}
+          </div>
+        `;
+      } finally {
+        submitBtn.disabled = false;
+        status.classList.add("hidden");
+      }
+    });
+  </script>
+</body>
+</html>
