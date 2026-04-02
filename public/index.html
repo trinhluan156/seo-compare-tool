@@ -3,129 +3,188 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SEO Compare Tool</title>
+  <title>SEO Compare HTML Tool</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <div class="container">
-    <section class="hero card">
-      <h1>SEO Compare Tool</h1>
-      <p>
-        So sánh nội dung file DOCX với bài viết trên web, làm nổi bật phần khác biệt
-        để bạn kiểm tra nhanh trước khi đăng bài hoặc tối ưu SEO.
-      </p>
-    </section>
+  <h1>SEO Compare HTML Tool</h1>
+  <p class="description">
+    So sánh nội dung chính của một URL bài viết với file HTML bạn tải lên.
+  </p>
 
-    <section class="form-card card">
-      <form id="compareForm" class="form-grid">
-        <div class="field">
-          <label for="url">URL bài viết</label>
-          <input
-            class="input"
-            type="url"
-            id="url"
-            name="url"
-            required
-            placeholder="https://example.com/bai-viet"
-          />
-        </div>
+  <div class="card">
+    <form id="compareForm">
+      <label for="url">URL bài viết</label>
+      <input
+        type="url"
+        id="url"
+        name="url"
+        placeholder="https://example.com/bai-viet"
+        required
+      />
+      <div class="helper">
+        Nhập đúng URL bài viết gốc cần đối chiếu.
+      </div>
 
-        <div class="field">
-          <label for="docxFile">File DOCX</label>
-          <input
-            class="file-input"
-            type="file"
-            id="docxFile"
-            name="docxFile"
-            accept=".docx"
-            required
-          />
-          <div class="file-note">Hỗ trợ file .docx, dung lượng tối đa 20MB.</div>
-        </div>
+      <label for="htmlFile">File HTML</label>
+      <input
+        type="file"
+        id="htmlFile"
+        name="htmlFile"
+        accept=".html,.htm"
+        required
+      />
+      <div class="helper">
+        Chỉ hỗ trợ file .html hoặc .htm.
+      </div>
 
-        <div class="button-row">
-          <button id="submitBtn" type="submit">So sánh ngay</button>
-          <div id="status" class="status hidden">
-            <span class="status-dot"></span>
-            <span>Đang xử lý dữ liệu...</span>
-          </div>
-        </div>
-      </form>
-    </section>
+      <button type="submit" id="submitBtn">So sánh ngay</button>
+    </form>
 
-    <section id="resultSection" class="result-card card hidden">
-      <div id="result"></div>
-    </section>
-
-    <div class="footer-note">
-      Tool chạy bằng Node.js, Express, Playwright và Mammoth.
-    </div>
+    <div id="statusArea"></div>
   </div>
+
+  <div id="resultArea" class="result-wrap"></div>
 
   <script>
     const form = document.getElementById("compareForm");
-    const result = document.getElementById("result");
-    const resultSection = document.getElementById("resultSection");
     const submitBtn = document.getElementById("submitBtn");
-    const status = document.getElementById("status");
+    const statusArea = document.getElementById("statusArea");
+    const resultArea = document.getElementById("resultArea");
+
+    function escapeHtml(str) {
+      return String(str)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function setStatus(message, type = "loading") {
+      statusArea.innerHTML = `<div class="status ${type}">${message}</div>`;
+    }
+
+    function clearResult() {
+      resultArea.innerHTML = "";
+    }
+
+    function renderResult(data) {
+      const title = data.articleTitle
+        ? escapeHtml(data.articleTitle)
+        : "Không có tiêu đề";
+
+      const changedCount =
+        typeof data.changedCount === "number" ? data.changedCount : "-";
+
+      const exactMatchText = data.exactMatchAfterNormalization
+        ? "Có"
+        : "Không";
+
+      const highlightedHtml =
+        data.highlightedFileHtml ||
+        `<div class="preview-box">Không có dữ liệu hiển thị.</div>`;
+
+      const debugHtml = data.debug
+        ? `
+          <details>
+            <summary>Debug</summary>
+            <pre>${escapeHtml(JSON.stringify(data.debug, null, 2))}</pre>
+          </details>
+        `
+        : "";
+
+      resultArea.innerHTML = `
+        <div class="summary-grid">
+          <div class="summary-box">
+            <div class="summary-label">Tiêu đề bài viết</div>
+            <div class="summary-value">${title}</div>
+          </div>
+
+          <div class="summary-box">
+            <div class="summary-label">Số từ khác biệt</div>
+            <div class="summary-value">${changedCount}</div>
+          </div>
+
+          <div class="summary-box">
+            <div class="summary-label">Khớp hoàn toàn sau chuẩn hóa</div>
+            <div class="summary-value">${exactMatchText}</div>
+          </div>
+
+          <div class="summary-box">
+            <div class="summary-label">Trạng thái</div>
+            <div class="summary-value">${data.success ? "Thành công" : "Thất bại"}</div>
+          </div>
+        </div>
+
+        <div class="preview-box">
+          ${highlightedHtml}
+        </div>
+
+        ${debugHtml}
+
+        <div class="footer-note">
+          Các từ được tô vàng là phần xuất hiện trong file HTML tải lên nhưng không khớp hoàn toàn với nội dung chính lấy từ URL.
+        </div>
+      `;
+    }
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
+      clearResult();
 
-      resultSection.classList.remove("hidden");
-      result.innerHTML = "";
-      submitBtn.disabled = true;
-      status.classList.remove("hidden");
+      const url = document.getElementById("url").value.trim();
+      const fileInput = document.getElementById("htmlFile");
+      const file = fileInput.files[0];
 
-      const fileInput = document.getElementById("docxFile");
-      const urlInput = document.getElementById("url");
+      if (!url) {
+        setStatus("Vui lòng nhập URL bài viết.", "error");
+        return;
+      }
+
+      if (!file) {
+        setStatus("Vui lòng chọn file HTML.", "error");
+        return;
+      }
+
+      const fileName = file.name || "";
+      if (!/\.(html?|xhtml)$/i.test(fileName)) {
+        setStatus("File không hợp lệ. Chỉ chấp nhận .html hoặc .htm.", "error");
+        return;
+      }
 
       const formData = new FormData();
-      formData.append("url", urlInput.value);
-      formData.append("docxFile", fileInput.files[0]);
+      formData.append("url", url);
+      formData.append("htmlFile", file);
+
+      submitBtn.disabled = true;
+      setStatus("Đang tải file và phân tích nội dung, vui lòng chờ...", "loading");
 
       try {
-        const res = await fetch("/compare-docx", {
+        const response = await fetch("/compare-html", {
           method: "POST",
           body: formData
         });
 
-        const data = await res.json();
+        const data = await response.json();
 
-        if (!res.ok) {
-          result.innerHTML = `
-            <div class="error-box">
-              <strong>Lỗi:</strong> ${data.error || "Không xác định"}
-              ${data.details ? `<div style="margin-top:8px;">${data.details}</div>` : ""}
-            </div>
-          `;
+        if (!response.ok) {
+          setStatus(
+            escapeHtml(data.error || "Có lỗi xảy ra khi xử lý yêu cầu."),
+            "error"
+          );
           return;
         }
 
-        result.innerHTML = `
-          <div class="result-header">
-            <h2>${data.articleTitle || "Không có tiêu đề"}</h2>
-            <div class="result-meta">
-              <div class="meta-badge">Số từ khác: ${data.changedCount}</div>
-              <div class="meta-badge">
-                Chuẩn hóa khớp hoàn toàn: ${data.exactMatchAfterNormalization ? "Có" : "Không"}
-              </div>
-            </div>
-          </div>
-
-          <div class="diff-list">
-            ${data.highlightedDocHtml}
-          </div>
-        `;
-      } catch (err) {
-        result.innerHTML = `
-          <div class="error-box">
-            <strong>Lỗi:</strong> ${err.message}
-          </div>
-        `;
+        setStatus("So sánh hoàn tất.", "success");
+        renderResult(data);
+      } catch (error) {
+        setStatus(
+          `Không thể kết nối tới server: ${escapeHtml(error.message || "Lỗi không xác định")}`,
+          "error"
+        );
       } finally {
         submitBtn.disabled = false;
-        status.classList.add("hidden");
       }
     });
   </script>

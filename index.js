@@ -11,13 +11,66 @@ process.env.PLAYWRIGHT_BROWSERS_PATH =
   process.env.PLAYWRIGHT_BROWSERS_PATH || "0";
 
 app.use(cors());
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
 
+/* =========================
+   LAZY LOAD LIBS
+========================= */
+
+let playwrightLib = null;
+let jsdomLib = null;
+let readabilityLib = null;
+
+function getPlaywright() {
+  if (!playwrightLib) playwrightLib = require("playwright");
+  return playwrightLib;
+}
+
+function getJSDOM() {
+  if (!jsdomLib) jsdomLib = require("jsdom");
+  return jsdomLib;
+}
+
+function getReadability() {
+  if (!readabilityLib) readabilityLib = require("@mozilla/readability");
+  return readabilityLib;
+}
+
+/* =========================
+   MEMORY LOG
+========================= */
+
+function logMemory(label) {
+  const m = process.memoryUsage();
+  console.log(label, {
+    rssMB: (m.rss / 1024 / 1024).toFixed(1),
+    heapUsedMB: (m.heapUsed / 1024 / 1024).toFixed(1),
+    heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1)
+  });
+}
+
+/* =========================
+   UPLOAD
+========================= */
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const isHtmlMime =
+      file.mimetype === "text/html" ||
+      file.mimetype === "application/xhtml+xml";
+
+    const isHtmlExt = /\.(html?|xhtml)$/i.test(file.originalname || "");
+
+    if (isHtmlMime || isHtmlExt) {
+      return cb(null, true);
+    }
+
+    return cb(new Error("Chỉ chấp nhận file .html hoặc .htm"));
+  }
 });
 
 const DEFAULT_USER_AGENT =
@@ -29,43 +82,6 @@ const urlCache = new Map();
 
 let sharedBrowser = null;
 let browserInitPromise = null;
-
-/* =========================
-   LAZY LOAD HEAVY LIBS
-========================= */
-
-let playwrightLib = null;
-let jsdomLib = null;
-let readabilityLib = null;
-
-async function getPlaywright() {
-  if (!playwrightLib) playwrightLib = require("playwright");
-  return playwrightLib;
-}
-
-async function getJSDOM() {
-  if (!jsdomLib) jsdomLib = require("jsdom");
-  return jsdomLib;
-}
-
-async function getReadability() {
-  if (!readabilityLib) readabilityLib = require("@mozilla/readability");
-  return readabilityLib;
-}
-
-/* =========================
-   DEBUG MEMORY
-========================= */
-
-function logMemory(label) {
-  const m = process.memoryUsage();
-  console.log(label, {
-    rssMB: (m.rss / 1024 / 1024).toFixed(1),
-    heapUsedMB: (m.heapUsed / 1024 / 1024).toFixed(1),
-    heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1),
-    externalMB: (m.external / 1024 / 1024).toFixed(1)
-  });
-}
 
 /* =========================
    BASIC HELPERS
@@ -180,19 +196,6 @@ function similarityScore(a, b) {
   return common / Math.max(wordsA.length, wordsB.length);
 }
 
-function safeDecodeBufferToString(buffer) {
-  if (!buffer) return "";
-  return buffer.toString("utf8").replace(/^\uFEFF/, "");
-}
-
-function pruneCache() {
-  while (urlCache.size > MAX_CACHE_ITEMS) {
-    const oldestKey = urlCache.keys().next().value;
-    if (!oldestKey) break;
-    urlCache.delete(oldestKey);
-  }
-}
-
 /* =========================
    BROWSER REUSE
 ========================= */
@@ -201,7 +204,7 @@ async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
   if (browserInitPromise) return browserInitPromise;
 
-  const { chromium } = await getPlaywright();
+  const { chromium } = getPlaywright();
 
   const launchOptions = {
     headless: true,
@@ -238,15 +241,14 @@ async function closeSharedBrowser() {
   }
 }
 
-process.on("SIGINT", async () => {
+async function shutdown(signal) {
+  console.log(`Nhận tín hiệu ${signal}, đang tắt browser...`);
   await closeSharedBrowser();
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", async () => {
-  await closeSharedBrowser();
-  process.exit(0);
-});
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 /* =========================
    HTML FETCH
@@ -256,7 +258,6 @@ async function getHtmlWithAxios(url) {
   const response = await axios.get(url, {
     timeout: 12000,
     maxRedirects: 5,
-    responseType: "text",
     headers: {
       "User-Agent": DEFAULT_USER_AGENT,
       "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
@@ -270,8 +271,8 @@ async function getHtmlWithAxios(url) {
 
 async function looksLikeReadableArticle(html, url) {
   try {
-    const { JSDOM } = await getJSDOM();
-    const { Readability } = await getReadability();
+    const { JSDOM } = getJSDOM();
+    const { Readability } = getReadability();
 
     const dom = new JSDOM(html, { url });
     const article = new Readability(dom.window.document).parse();
@@ -319,7 +320,6 @@ async function getBestHtml(url) {
   }
 
   let html;
-
   try {
     const axiosHtml = await getHtmlWithAxios(url);
     if (await looksLikeReadableArticle(axiosHtml, url)) {
@@ -337,7 +337,11 @@ async function getBestHtml(url) {
     createdAt: Date.now()
   });
 
-  pruneCache();
+  if (urlCache.size > MAX_CACHE_ITEMS) {
+    const oldestKey = urlCache.keys().next().value;
+    if (oldestKey) urlCache.delete(oldestKey);
+  }
+
   return html;
 }
 
@@ -346,7 +350,7 @@ async function getBestHtml(url) {
 ========================= */
 
 async function cleanHtmlForComparison(html) {
-  const { JSDOM } = await getJSDOM();
+  const { JSDOM } = getJSDOM();
 
   const dom = new JSDOM(`<div id="root">${html}</div>`);
   const document = dom.window.document;
@@ -356,7 +360,7 @@ async function cleanHtmlForComparison(html) {
 
   root
     .querySelectorAll(
-      "script, style, noscript, svg, canvas, iframe, figure, figcaption, meta, link"
+      "script, style, noscript, svg, canvas, iframe, figure, figcaption, link, meta"
     )
     .forEach((el) => el.remove());
 
@@ -379,7 +383,7 @@ async function cleanHtmlForComparison(html) {
     });
   });
 
-  return root.innerHTML || "";
+  return root.innerHTML;
 }
 
 function headingLevel(tagName) {
@@ -407,7 +411,7 @@ function buildTableRowText(cells) {
 }
 
 async function extractOrderedBlocksFromHtml(html) {
-  const { JSDOM } = await getJSDOM();
+  const { JSDOM } = getJSDOM();
 
   const dom = new JSDOM(`<div id="root">${html}</div>`);
   const document = dom.window.document;
@@ -467,8 +471,8 @@ async function extractOrderedBlocksFromHtml(html) {
         "iframe",
         "figure",
         "figcaption",
-        "meta",
-        "link"
+        "link",
+        "meta"
       ].includes(tag)
     ) {
       return;
@@ -517,8 +521,8 @@ function blocksToFullText(blocks) {
 }
 
 async function extractMainContentFromWeb(html, url) {
-  const { JSDOM } = await getJSDOM();
-  const { Readability } = await getReadability();
+  const { JSDOM } = getJSDOM();
+  const { Readability } = getReadability();
 
   const dom = new JSDOM(html, { url });
   const reader = new Readability(dom.window.document);
@@ -539,11 +543,38 @@ async function extractMainContentFromWeb(html, url) {
   };
 }
 
-async function extractContentFromUploadedHtml(htmlString) {
-  const cleanHtml = await cleanHtmlForComparison(htmlString);
+async function extractMainContentFromUploadedHtml(html, baseUrl = "https://local.upload/") {
+  const { JSDOM } = getJSDOM();
+  const { Readability } = getReadability();
+
+  let cleanSource = String(html || "");
+
+  if (!/<html[\s>]/i.test(cleanSource)) {
+    cleanSource = `<!doctype html><html><head><meta charset="utf-8"></head><body>${cleanSource}</body></html>`;
+  }
+
+  const dom = new JSDOM(cleanSource, { url: baseUrl });
+  const reader = new Readability(dom.window.document);
+  const article = reader.parse();
+
+  let htmlContent = "";
+  let title = "";
+
+  if (article && article.content) {
+    htmlContent = article.content;
+    title = article.title || "";
+  } else {
+    htmlContent = dom.window.document.body
+      ? dom.window.document.body.innerHTML
+      : cleanSource;
+    title = dom.window.document.title || "";
+  }
+
+  const cleanHtml = await cleanHtmlForComparison(htmlContent);
   const blocks = await extractOrderedBlocksFromHtml(cleanHtml);
 
   return {
+    title,
     html: cleanHtml,
     blocks,
     fullText: blocksToFullText(blocks)
@@ -676,7 +707,6 @@ function alignBlocksOrdered(webBlocks, fileBlocks, lookAhead = 2) {
       fileGroup: f.group,
       score: blockCompatible(w, f) ? similarityScore(w.text, f.text) : 0
     });
-
     i++;
     j++;
   }
@@ -719,16 +749,16 @@ function getChangedFileWordsOnly(webText, fileText) {
 }
 
 function buildHighlightedBlock(fileText, webText) {
-  const addedWords = getChangedFileWordsOnly(webText, fileText);
+  const addedFileWords = getChangedFileWordsOnly(webText, fileText);
 
-  if (!addedWords.length) {
+  if (!addedFileWords.length) {
     return {
       changedCount: 0,
       highlightedHtml: escapeHtml(fileText)
     };
   }
 
-  const pool = [...addedWords];
+  const pool = [...addedFileWords];
   const originalPieces = fileText.match(/\S+|\s+/g) || [];
   let changedCount = 0;
 
@@ -742,7 +772,7 @@ function buildHighlightedBlock(fileText, webText) {
       if (idx !== -1) {
         pool.splice(idx, 1);
         changedCount++;
-        return `<mark class="diff-word-doc">${escapeHtml(piece)}</mark>`;
+        return `<mark class="diff-word-file">${escapeHtml(piece)}</mark>`;
       }
 
       return escapeHtml(piece);
@@ -778,9 +808,7 @@ function buildResultHtmlFromPairs(pairs) {
       renderedBlocks.push(`
         <div class="diff-block">
           <div class="diff-block-meta">
-            Đoạn #${pair.fileIndex + 1} | Loại: ${escapeHtml(
-              pair.fileTag || "text"
-            )} | Độ giống: ${(pair.score * 100).toFixed(1)}%
+            Đoạn #${pair.fileIndex + 1} | Loại: ${escapeHtml(pair.fileTag || "text")} | Độ giống: ${(pair.score * 100).toFixed(1)}%
           </div>
           <div class="diff-block-content">${blockResult.highlightedHtml}</div>
         </div>
@@ -803,16 +831,12 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    uptime: process.uptime(),
-    cacheItems: urlCache.size
-  });
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
 app.post("/compare-html", upload.single("htmlFile"), async (req, res) => {
   try {
-    logMemory("before compare-html");
+    logMemory("before compare");
 
     const { url } = req.body;
     const file = req.file;
@@ -829,35 +853,15 @@ app.post("/compare-html", upload.single("htmlFile"), async (req, res) => {
       });
     }
 
-    const filename = (file.originalname || "").toLowerCase();
-    const mimetype = (file.mimetype || "").toLowerCase();
+    const uploadedHtml = file.buffer.toString("utf8");
 
-    const isHtmlFile =
-      filename.endsWith(".html") ||
-      filename.endsWith(".htm") ||
-      mimetype.includes("text/html");
+    const renderedHtml = await getBestHtml(url);
+    logMemory("after fetch web html");
 
-    if (!isHtmlFile) {
-      return res.status(400).json({
-        error: "Chỉ chấp nhận file .html hoặc .htm"
-      });
-    }
+    const webData = await extractMainContentFromWeb(renderedHtml, url);
+    logMemory("after extract web");
 
-    const uploadedHtmlString = safeDecodeBufferToString(file.buffer);
-
-    if (!uploadedHtmlString.trim()) {
-      return res.status(400).json({
-        error: "File HTML rỗng hoặc không đọc được"
-      });
-    }
-
-    const webHtml = await getBestHtml(url);
-    logMemory("after get web html");
-
-    const webData = await extractMainContentFromWeb(webHtml, url);
-    logMemory("after extract web content");
-
-    const fileData = await extractContentFromUploadedHtml(uploadedHtmlString);
+    const fileData = await extractMainContentFromUploadedHtml(uploadedHtml, url);
     logMemory("after extract uploaded html");
 
     if (
@@ -871,16 +875,11 @@ app.post("/compare-html", upload.single("htmlFile"), async (req, res) => {
         articleTitle: webData.title,
         changedCount: 0,
         exactMatchAfterNormalization: true,
-        highlightedHtml: `
+        highlightedFileHtml: `
           <div class="preview-box">
             Nội dung file HTML khớp với nội dung chính của bài viết trên web sau khi chuẩn hóa tiếng Việt.
           </div>
-        `,
-        debug: {
-          webBlocks: webData.blocks.length,
-          fileBlocks: fileData.blocks.length,
-          alignedPairs: 0
-        }
+        `
       });
     }
 
@@ -892,12 +891,12 @@ app.post("/compare-html", upload.single("htmlFile"), async (req, res) => {
       articleTitle: webData.title,
       changedCount: result.totalChangedCount,
       exactMatchAfterNormalization: false,
-      highlightedHtml:
+      highlightedFileHtml:
         result.totalChangedCount > 0
           ? result.html
           : `
             <div class="preview-box">
-              Không tìm thấy khác biệt đủ tin cậy sau khi đối chiếu nội dung HTML với bài viết trên web.
+              Không tìm thấy khác biệt đủ tin cậy sau khi đối chiếu tiêu đề, đoạn văn và bảng.
             </div>
           `,
       debug: {
@@ -907,8 +906,9 @@ app.post("/compare-html", upload.single("htmlFile"), async (req, res) => {
       }
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
+    console.error("COMPARE ERROR:", error);
+
+    return res.status(500).json({
       error: "Không thể xử lý file HTML",
       details: error.message
     });
@@ -916,7 +916,25 @@ app.post("/compare-html", upload.single("htmlFile"), async (req, res) => {
 });
 
 /* =========================
-   START SERVER
+   ERROR HANDLER
+========================= */
+
+app.use((err, req, res, next) => {
+  console.error("GLOBAL ERROR:", err);
+
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({
+      error: `Lỗi upload: ${err.message}`
+    });
+  }
+
+  return res.status(400).json({
+    error: err.message || "Có lỗi xảy ra"
+  });
+});
+
+/* =========================
+   START
 ========================= */
 
 logMemory("startup");
