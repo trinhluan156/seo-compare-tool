@@ -11,50 +11,65 @@ process.env.PLAYWRIGHT_BROWSERS_PATH =
   process.env.PLAYWRIGHT_BROWSERS_PATH || "0";
 
 app.use(cors());
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
 
+/**
+ * Chặn sớm request quá lớn trước khi Multer đọc hết vào RAM
+ */
+app.use((req, res, next) => {
+  const contentLength = Number(req.headers["content-length"] || 0);
+  const maxBytes = 6 * 1024 * 1024; // nhỉnh hơn giới hạn file 5MB một chút
+
+  if (contentLength > maxBytes) {
+    return res.status(413).json({
+      error: "Request quá lớn. Vui lòng dùng file DOCX nhỏ hơn 5MB."
+    });
+  }
+
+  next();
+});
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 }
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
 });
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-const URL_CACHE_TTL_MS = 3 * 60 * 1000;
-const URL_CACHE_MAX_ITEMS = 10;
+const URL_CACHE_TTL_MS = 2 * 60 * 1000;
+const URL_CACHE_MAX_SIZE = 5;
 const urlCache = new Map();
 
 let sharedBrowser = null;
 let browserInitPromise = null;
 
-/* =========================
-   LAZY LOAD HEAVY LIBS
-========================= */
-
+/**
+ * Lazy-loaded heavy libs
+ */
 let mammothLib = null;
 let playwrightLib = null;
 let jsdomLib = null;
 let readabilityLib = null;
 
-function getMammoth() {
+async function getMammoth() {
   if (!mammothLib) mammothLib = require("mammoth");
   return mammothLib;
 }
 
-function getPlaywright() {
+async function getPlaywright() {
   if (!playwrightLib) playwrightLib = require("playwright");
   return playwrightLib;
 }
 
-function getJSDOM() {
+async function getJSDOM() {
   if (!jsdomLib) jsdomLib = require("jsdom");
   return jsdomLib;
 }
 
-function getReadability() {
+async function getReadability() {
   if (!readabilityLib) readabilityLib = require("@mozilla/readability");
   return readabilityLib;
 }
@@ -62,6 +77,15 @@ function getReadability() {
 /* =========================
    BASIC HELPERS
 ========================= */
+
+function logMemory(label) {
+  const m = process.memoryUsage();
+  console.log(label, {
+    rssMB: (m.rss / 1024 / 1024).toFixed(1),
+    heapUsedMB: (m.heapUsed / 1024 / 1024).toFixed(1),
+    heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1)
+  });
+}
 
 function isValidHttpUrl(value) {
   try {
@@ -172,23 +196,6 @@ function similarityScore(a, b) {
   return common / Math.max(wordsA.length, wordsB.length);
 }
 
-function logMemory(label) {
-  const m = process.memoryUsage();
-  console.log(label, {
-    rssMB: (m.rss / 1024 / 1024).toFixed(1),
-    heapUsedMB: (m.heapUsed / 1024 / 1024).toFixed(1),
-    heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1)
-  });
-}
-
-function trimCacheIfNeeded() {
-  while (urlCache.size > URL_CACHE_MAX_ITEMS) {
-    const oldestKey = urlCache.keys().next().value;
-    if (!oldestKey) break;
-    urlCache.delete(oldestKey);
-  }
-}
-
 /* =========================
    BROWSER REUSE
 ========================= */
@@ -197,7 +204,7 @@ async function getSharedBrowser() {
   if (sharedBrowser) return sharedBrowser;
   if (browserInitPromise) return browserInitPromise;
 
-  const { chromium } = getPlaywright();
+  const { chromium } = await getPlaywright();
 
   const launchOptions = {
     headless: true,
@@ -206,10 +213,7 @@ async function getSharedBrowser() {
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--disable-software-rasterizer",
-      "--disable-background-networking",
-      "--disable-background-timer-throttling",
-      "--disable-renderer-backgrounding"
+      "--disable-software-rasterizer"
     ]
   };
 
@@ -255,22 +259,19 @@ async function getHtmlWithAxios(url) {
     timeout: 12000,
     maxRedirects: 5,
     responseType: "text",
-    transformResponse: [(data) => data],
     headers: {
       "User-Agent": DEFAULT_USER_AGENT,
       "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     }
   });
 
-  return typeof response.data === "string"
-    ? response.data
-    : String(response.data || "");
+  return response.data;
 }
 
 async function looksLikeReadableArticle(html, url) {
   try {
-    const { JSDOM } = getJSDOM();
-    const { Readability } = getReadability();
+    const { JSDOM } = await getJSDOM();
+    const { Readability } = await getReadability();
 
     const dom = new JSDOM(html, { url });
     const article = new Readability(dom.window.document).parse();
@@ -305,11 +306,17 @@ async function getHtmlWithPlaywright(url) {
     });
 
     await page.waitForTimeout(1200);
-
-    const html = await page.content();
-    return html;
+    return await page.content();
   } finally {
     await page.close();
+  }
+}
+
+function pruneUrlCache() {
+  while (urlCache.size > URL_CACHE_MAX_SIZE) {
+    const oldestKey = urlCache.keys().next().value;
+    if (!oldestKey) break;
+    urlCache.delete(oldestKey);
   }
 }
 
@@ -320,10 +327,8 @@ async function getBestHtml(url) {
   }
 
   let html;
-
   try {
     const axiosHtml = await getHtmlWithAxios(url);
-
     if (await looksLikeReadableArticle(axiosHtml, url)) {
       html = axiosHtml;
     } else {
@@ -339,7 +344,7 @@ async function getBestHtml(url) {
     createdAt: Date.now()
   });
 
-  trimCacheIfNeeded();
+  pruneUrlCache();
   return html;
 }
 
@@ -348,7 +353,7 @@ async function getBestHtml(url) {
 ========================= */
 
 async function cleanHtmlForComparison(html) {
-  const { JSDOM } = getJSDOM();
+  const { JSDOM } = await getJSDOM();
 
   const dom = new JSDOM(`<div id="root">${html}</div>`);
   const document = dom.window.document;
@@ -380,10 +385,7 @@ async function cleanHtmlForComparison(html) {
     });
   });
 
-  const cleaned = root.innerHTML;
-
-  dom.window.close();
-  return cleaned;
+  return root.innerHTML;
 }
 
 function headingLevel(tagName) {
@@ -404,11 +406,14 @@ function getCellText(cell) {
 }
 
 function buildTableRowText(cells) {
-  return cells.map((c) => normalizeForStrictCompare(c)).filter(Boolean).join(" | ");
+  return cells
+    .map((c) => normalizeForStrictCompare(c))
+    .filter(Boolean)
+    .join(" | ");
 }
 
 async function extractOrderedBlocksFromHtml(html) {
-  const { JSDOM } = getJSDOM();
+  const { JSDOM } = await getJSDOM();
 
   const dom = new JSDOM(`<div id="root">${html}</div>`);
   const document = dom.window.document;
@@ -488,16 +493,15 @@ async function extractOrderedBlocksFromHtml(html) {
     [...node.children].forEach(walk);
   }
 
-  if (root) {
-    [...root.children].forEach(walk);
+  if (!root) return blocks;
 
-    if (!blocks.length) {
-      const text = normalizeForStrictCompare(root.textContent || "");
-      if (text) pushBlock("p", text);
-    }
+  [...root.children].forEach(walk);
+
+  if (!blocks.length) {
+    const text = normalizeForStrictCompare(root.textContent || "");
+    if (text) pushBlock("p", text);
   }
 
-  dom.window.close();
   return blocks;
 }
 
@@ -506,14 +510,12 @@ function blocksToFullText(blocks) {
 }
 
 async function extractMainContentFromWeb(html, url) {
-  const { JSDOM } = getJSDOM();
-  const { Readability } = getReadability();
+  const { JSDOM } = await getJSDOM();
+  const { Readability } = await getReadability();
 
   const dom = new JSDOM(html, { url });
   const reader = new Readability(dom.window.document);
   const article = reader.parse();
-
-  dom.window.close();
 
   if (!article || !article.content) {
     throw new Error("Không bóc được nội dung chính từ web");
@@ -524,14 +526,17 @@ async function extractMainContentFromWeb(html, url) {
 
   return {
     title: article.title || "",
-    html: cleanHtml,
     blocks,
     fullText: blocksToFullText(blocks)
   };
 }
 
-async function convertDocxToHtml(buffer) {
-  const mammoth = getMammoth();
+/**
+ * DOCX nhỏ: dùng HTML mode để giữ heading/list/table tốt hơn
+ * Không trả về html để tránh giữ chuỗi lớn trong RAM
+ */
+async function convertDocxToHtmlBlocks(buffer) {
+  const mammoth = await getMammoth();
 
   const result = await mammoth.convertToHtml(
     { buffer },
@@ -542,11 +547,50 @@ async function convertDocxToHtml(buffer) {
   const blocks = await extractOrderedBlocksFromHtml(cleanHtml);
 
   return {
-    html: cleanHtml,
     blocks,
     fullText: blocksToFullText(blocks),
     messages: result.messages || []
   };
+}
+
+/**
+ * DOCX lớn: dùng raw text mode để giảm RAM
+ */
+async function convertDocxToTextBlocks(buffer) {
+  const mammoth = await getMammoth();
+
+  const result = await mammoth.extractRawText({ buffer });
+
+  const rawText = result.value || "";
+  const lines = rawText
+    .split("\n")
+    .map((line) => normalizeForStrictCompare(line))
+    .filter(Boolean);
+
+  const blocks = lines.map((text, index) => ({
+    tag: "p",
+    group: "text",
+    level: null,
+    text,
+    order: index
+  }));
+
+  return {
+    blocks,
+    fullText: blocksToFullText(blocks),
+    messages: result.messages || []
+  };
+}
+
+async function convertDocxSmart(buffer) {
+  const sizeMB = buffer.length / 1024 / 1024;
+
+  // File lớn thì dùng extractRawText để tránh RAM tăng vọt
+  if (sizeMB > 1.5) {
+    return await convertDocxToTextBlocks(buffer);
+  }
+
+  return await convertDocxToHtmlBlocks(buffer);
 }
 
 /* =========================
@@ -799,11 +843,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    uptime: process.uptime(),
-    cacheSize: urlCache.size
-  });
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
 app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
@@ -825,13 +865,16 @@ app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
       });
     }
 
+    const docBuffer = file.buffer;
+    req.file = undefined;
+
     const renderedHtml = await getBestHtml(url);
     logMemory("after getBestHtml");
 
     const webData = await extractMainContentFromWeb(renderedHtml, url);
     logMemory("after web extract");
 
-    const docData = await convertDocxToHtml(file.buffer);
+    const docData = await convertDocxSmart(docBuffer);
     logMemory("after docx convert");
 
     if (
@@ -867,24 +910,47 @@ app.post("/compare-docx", upload.single("docxFile"), async (req, res) => {
           ? result.html
           : `
             <div class="preview-box">
-              Không tìm thấy khác biệt đủ tin cậy sau khi đối chiếu tiêu đề, đoạn văn và bảng.
+              Không tìm thấy khác biệt đủ tin cậy sau khi đối chiếu.
             </div>
           `,
       conversionMessages: docData.messages,
       debug: {
         webBlocks: webData.blocks.length,
         docBlocks: docData.blocks.length,
-        alignedPairs: pairs.length,
-        cacheSize: urlCache.size
+        alignedPairs: pairs.length
       }
     });
   } catch (error) {
-    console.error("COMPARE ERROR:", error);
+    console.error(error);
     return res.status(500).json({
       error: "Không thể xử lý file DOCX",
       details: error.message
     });
   }
+});
+
+/* =========================
+   ERROR HANDLER
+========================= */
+
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        error: "File DOCX quá lớn. Vui lòng dùng file dưới 5MB."
+      });
+    }
+
+    return res.status(400).json({
+      error: `Lỗi upload: ${err.message}`
+    });
+  }
+
+  console.error(err);
+  return res.status(500).json({
+    error: "Lỗi máy chủ",
+    details: err.message
+  });
 });
 
 logMemory("startup");
